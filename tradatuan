@@ -1,0 +1,184 @@
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+using System;
+using System.Linq;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class WyckoffBotFinal : Robot
+    {
+        [Parameter("Lot Size", DefaultValue = 1.0)]
+        public double LotSize { get; set; }
+
+        [Parameter("Risk/Reward Ratio (TP:SL)", DefaultValue = 4.0)]
+        public double RiskRewardRatio { get; set; }
+
+        [Parameter("Trailing Stop (Pips)", DefaultValue = 20)]
+        public int TrailingStopPips { get; set; }
+
+        [Parameter("Supply/Demand Zone Length", DefaultValue = 50)]
+        public int SupplyDemandZoneLength { get; set; }
+
+        [Parameter("Wyckoff Period (Bars)", DefaultValue = 100)]
+        public int WyckoffPeriod { get; set; }
+
+        private double supplyZone;
+        private double demandZone;
+
+        private ExponentialMovingAverage _emaFast;
+        private ExponentialMovingAverage _emaSlow;
+        private VolumeOscillator _volumeOscillator;
+
+        protected override void OnStart()
+        {
+            // Khởi tạo các chỉ báo EMA và Volume Oscillator
+            _emaFast = Indicators.ExponentialMovingAverage(MarketSeries.Close, 12);
+            _emaSlow = Indicators.ExponentialMovingAverage(MarketSeries.Close, 26);
+            _volumeOscillator = Indicators.VolumeOscillator(ShortTerm: 14, LongTerm: 28);
+        }
+
+        protected override void OnBar()
+        {
+            // Xác định vùng cung và cầu
+            supplyZone = CalculateSupplyDemandZone(true);
+            demandZone = CalculateSupplyDemandZone(false);
+
+            // Kiểm tra các tín hiệu giao dịch dựa trên các giai đoạn Wyckoff
+            if (IsAccumulationPhase() && ShouldBuy())
+            {
+                ExecuteTrade(TradeType.Buy);
+            }
+
+            if (IsDistributionPhase() && ShouldSell())
+            {
+                ExecuteTrade(TradeType.Sell);
+            }
+        }
+
+        private double CalculateSupplyDemandZone(bool isSupply)
+        {
+            double zone = isSupply ? High[1] : Low[1];
+            for (int i = 1; i <= SupplyDemandZoneLength; i++)
+            {
+                if (isSupply)
+                    zone = Math.Max(zone, High[i]);
+                else
+                    zone = Math.Min(zone, Low[i]);
+            }
+            return zone;
+        }
+
+        private bool ShouldBuy()
+        {
+            return (IsBullishEngulfing(1) || IsPinBar(1, true) || IsInsideBar(1)) &&
+                   MarketSeries.Close[1] > _emaFast.Result[1] &&
+                   MarketSeries.Close[1] > _emaSlow.Result[1] &&
+                   MarketSeries.Close[1] > demandZone &&
+                   _volumeOscillator.Result.LastValue > 0; // Xác nhận volume tăng
+        }
+
+        private bool ShouldSell()
+        {
+            return (IsBearishEngulfing(1) || IsPinBar(1, false) || IsInsideBar(1)) &&
+                   MarketSeries.Close[1] < _emaFast.Result[1] &&
+                   MarketSeries.Close[1] < _emaSlow.Result[1] &&
+                   MarketSeries.Close[1] < supplyZone &&
+                   _volumeOscillator.Result.LastValue < 0; // Xác nhận volume giảm
+        }
+
+        private void ExecuteTrade(TradeType tradeType)
+        {
+            double stopLoss = tradeType == TradeType.Buy ? demandZone : supplyZone;
+            double takeProfit = tradeType == TradeType.Buy
+                ? MarketSeries.Close[1] + (MarketSeries.Close[1] - stopLoss) * RiskRewardRatio
+                : MarketSeries.Close[1] - (stopLoss - MarketSeries.Close[1]) * RiskRewardRatio;
+
+            var result = ExecuteMarketOrder(tradeType, SymbolName, LotSize, "WyckoffTrade", stopLoss, takeProfit);
+
+            if (result.IsSuccessful)
+            {
+                SetTrailingStop(result.Position, TrailingStopPips);
+            }
+        }
+
+        private void SetTrailingStop(Position position, int trailingStopPips)
+        {
+            if (position == null)
+                return;
+
+            double trailingStop = Symbol.PipSize * trailingStopPips;
+            if (position.TradeType == TradeType.Buy)
+            {
+                double newStopLoss = MarketSeries.Close.LastValue - trailingStop;
+                if (position.StopLoss == null || newStopLoss > position.StopLoss)
+                {
+                    ModifyPosition(position, newStopLoss, position.TakeProfit);
+                }
+            }
+            else if (position.TradeType == TradeType.Sell)
+            {
+                double newStopLoss = MarketSeries.Close.LastValue + trailingStop;
+                if (position.StopLoss == null || newStopLoss < position.StopLoss)
+                {
+                    ModifyPosition(position, newStopLoss, position.TakeProfit);
+                }
+            }
+        }
+
+        private bool IsBullishEngulfing(int index)
+        {
+            return MarketSeries.Close[index] > MarketSeries.Open[index] &&
+                   MarketSeries.Open[index] < MarketSeries.Close[index + 1] &&
+                   MarketSeries.Close[index] > MarketSeries.Open[index + 1];
+        }
+
+        private bool IsBearishEngulfing(int index)
+        {
+            return MarketSeries.Close[index] < MarketSeries.Open[index] &&
+                   MarketSeries.Open[index] > MarketSeries.Close[index + 1] &&
+                   MarketSeries.Close[index] < MarketSeries.Open[index + 1];
+        }
+
+        private bool IsPinBar(int index, bool isBullish)
+        {
+            double bodySize = Math.Abs(MarketSeries.Close[index] - MarketSeries.Open[index]);
+            double upperWick = MarketSeries.High[index] - Math.Max(MarketSeries.Close[index], MarketSeries.Open[index]);
+            double lowerWick = Math.Min(MarketSeries.Close[index], MarketSeries.Open[index]) - MarketSeries.Low[index];
+
+            if (isBullish)
+            {
+                return bodySize < (upperWick + lowerWick) * 0.3 && lowerWick > bodySize * 2;
+            }
+            else
+            {
+                return bodySize < (upperWick + lowerWick) * 0.3 && upperWick > bodySize * 2;
+            }
+        }
+
+        private bool IsInsideBar(int index)
+        {
+            return High[index] < High[index + 1] && Low[index] > Low[index + 1];
+        }
+
+        private bool IsAccumulationPhase()
+        {
+            double recentVolume = MarketSeries.TickVolume.Skip(MarketSeries.Close.Count - WyckoffPeriod).Sum();
+            double priorVolume = MarketSeries.TickVolume.Skip(MarketSeries.Close.Count - WyckoffPeriod * 2).Take(WyckoffPeriod).Sum();
+            return recentVolume > priorVolume && MarketSeries.Close.LastValue > demandZone;
+        }
+
+        private bool IsDistributionPhase()
+        {
+            double recentVolume = MarketSeries.TickVolume.Skip(MarketSeries.Close.Count - WyckoffPeriod).Sum();
+            double priorVolume = MarketSeries.TickVolume.Skip(MarketSeries.Close.Count - WyckoffPeriod * 2).Take(WyckoffPeriod).Sum();
+            return recentVolume < priorVolume && MarketSeries.Close.LastValue < supplyZone;
+        }
+
+        protected override void OnStop()
+        {
+            // Hàm dừng bot
+        }
+    }
+}
